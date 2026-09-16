@@ -3,6 +3,10 @@
 node_modules
 test-results
 
+# build artifacts
+dist
+*.tsbuildinfo
+
 
 # committed: .env.development.* (local docker creds only)
 # ignored: anything that might hold real secrets
