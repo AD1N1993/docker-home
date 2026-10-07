@@ -1,0 +1,115 @@
+name: Deploy
+
+on:
+  push:
+    branches: [week*]
+
+jobs:
+  checks:
+    uses: ./.github/workflows/typecheck.yaml
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: back
+            build_args: ""
+          - service: front
+            build_args: --build-arg VITE_API_URL=${{ vars.VITE_API_URL }}
+    env:
+      IMAGE: ${{ secrets.DOCKER_USER }}/todo-${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker Hub login
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_PASS: ${{ secrets.DOCKER_PASS }}
+        run: echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+
+      - name: Build
+        run: |
+          docker build ${{ matrix.build_args }} \
+            -t "$IMAGE:sha-${{ github.sha }}" \
+            -t "$IMAGE:latest" \
+            ${{ matrix.service }}
+
+      - name: Push
+        run: |
+          docker push "$IMAGE:sha-${{ github.sha }}"
+          docker push "$IMAGE:latest"
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd ~/myapp
+            sed -i "s|^APP_VERSION=.*|APP_VERSION=sha-${{ github.sha }}|" .env.development.compose
+            docker compose --env-file .env.development.compose pull back front
+            docker compose --env-file .env.development.compose up -d --no-deps back front
+            grep APP_VERSION .env.development.compose
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    env:
+      API_URL: ${{ vars.VITE_API_URL }}
+      EXPECTED: sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for new version
+        run: |
+          for i in $(seq 1 12); do
+            BODY=$(curl -s --max-time 5 "$API_URL/health" || true)
+            echo "try $i: $BODY"
+            echo "$BODY" | grep -q "\"version\":\"$EXPECTED\"" && exit 0
+            sleep 5
+          done
+          echo "Expected $EXPECTED, but health did not report it"
+          exit 1
+
+      - name: Smoke
+        run: |
+          export E2E_BASE_URL="${API_URL%/api}"
+          bash scripts/smoke.sh
+
+  notify:
+    needs: [checks, build, deploy, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram message
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHERE: ${{ github.repository }} @ ${{ github.ref_name }}
+        run: |
+          CHECKS="${{ needs.checks.result }}"
+          BUILD="${{ needs.build.result }}"
+          DEPLOY="${{ needs.deploy.result }}"
+          VERIFY="${{ needs.verify.result }}"
+
+          if   [ "$CHECKS" != "success" ]; then TEXT="❌ Type-check упал"
+          elif [ "$BUILD"  != "success" ]; then TEXT="❌ Build упал"
+          elif [ "$DEPLOY" != "success" ]; then TEXT="❌ Deploy упал"
+          elif [ "$VERIFY" != "success" ]; then TEXT="❌ Smoke не прошёл (задеплоено, но отвечает не то)"
+          else TEXT="✅ Деплой успешен%0AActor: ${{ github.actor }}%0AVersion: sha-${{ github.sha }}"
+          fi
+          TEXT="$TEXT%0A$WHERE%0A$RUN_URL"
+
+          RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT}" \
+            -d "text=$TEXT" \
+            -d "disable_web_page_preview=true")
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true' || { echo "Telegram API rejected"; exit 1; }
